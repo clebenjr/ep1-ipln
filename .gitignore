@@ -1,1 +1,4 @@
 test1_baseline.xlsx
+.env
+key_jev.txt
+experimentos/jev_cache.csv
