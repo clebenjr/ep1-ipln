@@ -24,6 +24,8 @@ Uso:
 """
 
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -77,15 +79,21 @@ def eval_sample(train: pd.DataFrame, n: int) -> pd.DataFrame:
     return pd.concat(parts).reset_index(drop=True)
 
 
-def pick_fewshot(train: pd.DataFrame, exclude_idx: set[int], k: int, max_chars: int = 400) -> dict[str, list[str]]:
-    """k exemplos por classe, fora do conjunto de avaliação, curtos e representativos."""
+def pick_fewshot(train: pd.DataFrame, exclude_idx: set[int], k: int,
+                 max_chars: int = 400) -> tuple[set[int], dict[str, list[str]]]:
+    """k exemplos por classe, fora de exclude_idx, curtos e representativos.
+
+    Devolve (índices escolhidos, {classe: [textos]}). Os índices permitem excluir
+    os próprios exemplos few-shot da avaliação, evitando vazamento.
+    """
     pool = train[~train["idx"].isin(exclude_idx)].copy()
     pool = pool[pool[TEXT_COL].str.len().between(100, 600)]  # evita outliers e textos triviais
-    out = {}
+    idx, texts = set(), {}
     for lbl in LABELS:
         g = pool[pool[LABEL_COL] == lbl].sample(k, random_state=SEED)
-        out[lbl] = [t[:max_chars] for t in g[TEXT_COL]]
-    return out
+        idx |= set(g["idx"])
+        texts[lbl] = [t[:max_chars] for t in g[TEXT_COL]]
+    return idx, texts
 
 
 def build_criteria(fewshot: dict[str, list[str]]) -> dict:
@@ -124,40 +132,69 @@ def main():
     ap = argparse.ArgumentParser(description="JEV few-shot + contexto enriquecido")
     ap.add_argument("--n", type=int, default=400, help="tamanho da amostra de avaliação (igual ao zero-shot)")
     ap.add_argument("--k", type=int, default=3, help="exemplos few-shot por classe")
+    ap.add_argument("--full", action="store_true", help="avalia TODO o treino (menos os exemplos few-shot)")
+    ap.add_argument("--holdout", action="store_true", help="avalia no MESMO holdout dos modelos finais (main.py)")
+    ap.add_argument("--workers", type=int, default=16, help="chamadas concorrentes (tier pago, sem rate limit)")
     ap.add_argument("--model", default=None, help="modelo (padrão: jev-latest do SDK)")
     args = ap.parse_args()
 
-    global CACHE_PATH
-    CACHE_PATH = CACHE_PATH.with_name(f"jev_fewshot_cache_k{args.k}.csv")
-
     train = load_train()
-    df = eval_sample(train, args.n)
-    fewshot = pick_fewshot(train, set(df["idx"]), args.k)
+    if args.holdout:
+        # MESMO holdout dos modelos finais (main.py): split estratificado 20%, seed 42.
+        # few-shot sorteado só do dev (80%), espelhando o que os supervisionados viram.
+        from sklearn.model_selection import train_test_split
+        dev, hold = train_test_split(train, test_size=0.2, stratify=train[LABEL_COL], random_state=SEED)
+        df = hold.reset_index(drop=True)
+        fs_idx, fewshot = pick_fewshot(dev, set(), args.k)
+        tag = f"holdout_k{args.k}"
+    elif args.full:
+        # few-shot primeiro; avalia em todo o resto do treino (sem vazamento)
+        fs_idx, fewshot = pick_fewshot(train, set(), args.k)
+        df = train[~train["idx"].isin(fs_idx)].reset_index(drop=True)
+        tag = f"full_k{args.k}"
+    else:
+        df = eval_sample(train, args.n)
+        fs_idx, fewshot = pick_fewshot(train, set(df["idx"]), args.k)
+        tag = f"k{args.k}"
     criteria = build_criteria(fewshot)
+
+    global CACHE_PATH
+    CACHE_PATH = CACHE_PATH.with_name(f"jev_fewshot_cache_{tag}.csv")
 
     print(f"Avaliação: {len(df)} exemplos | few-shot: {args.k}/classe | modelo: {args.model or 'jev-latest'}")
     print(df[LABEL_COL].value_counts().reindex(LABELS).to_string())
 
     cache = load_cache()
-    client_kwargs = {"model": args.model} if args.model else {}
-    with TypeSafeClient(**client_kwargs) as client:
-        for i, row in enumerate(df.itertuples(), 1):
-            idx = int(row.idx)
-            if idx in cache and cache[idx].get("pred") in LABELS:
-                continue
-            try:
-                r = client.system_one(
-                    state={"resposta_do_orgao": getattr(row, TEXT_COL)},
-                    questions={"clarity": Choice(instructions=INSTRUCTIONS, criteria=criteria)},
-                )
-                ans = r.choices["clarity"]
-            except TypeSafeAPIError as e:
-                print(f"[{i}/{len(df)}] idx={idx} ERRO {getattr(e, 'status', '?')}: {e}")
-                continue
-            cache[idx] = {"idx": idx, "gold": getattr(row, LABEL_COL), "pred": ans.choice, "conf": ans.confidence}
-            print(f"[{i}/{len(df)}] idx={idx} gold={cache[idx]['gold']} pred={ans.choice} conf={ans.confidence}")
-            save_cache(cache)
+    pending = [row for row in df.itertuples()
+               if int(row.idx) not in cache or cache[int(row.idx)].get("pred") not in LABELS]
+    print(f"A processar: {len(pending)} ({len(df) - len(pending)} já em cache) | workers: {args.workers}")
 
+    question = {"clarity": Choice(instructions=INSTRUCTIONS, criteria=criteria)}
+    client_kwargs = {"model": args.model} if args.model else {}
+    lock = threading.Lock()
+    done = 0
+
+    def work(row):
+        try:
+            r = client.system_one(state={"resposta_do_orgao": getattr(row, TEXT_COL)}, questions=question)
+            ans = r.choices["clarity"]
+            return int(row.idx), getattr(row, LABEL_COL), ans.choice, ans.confidence
+        except TypeSafeAPIError as e:
+            return int(row.idx), getattr(row, LABEL_COL), None, getattr(e, "status", "?")
+
+    with TypeSafeClient(**client_kwargs) as client:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for idx, gold, pred, info in ex.map(work, pending):
+                with lock:
+                    done += 1
+                    if pred in LABELS:
+                        cache[idx] = {"idx": idx, "gold": gold, "pred": pred, "conf": info}
+                    else:
+                        print(f"idx={idx} ERRO {info}")
+                    if done % 500 == 0:
+                        save_cache(cache)
+                        print(f"  ... {done}/{len(pending)}")
+    save_cache(cache)
     report(cache, df)
 
 
