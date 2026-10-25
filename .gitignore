@@ -1,9 +1,21 @@
-test1_baseline.xlsx
+# segredos
 .env
 key_jev.txt
-experimentos/jev_cache.csv
 
-bert_results.csv
+# artefatos de treino e inferencia
 out_*/
-experimentos/out_*/
-wandb/
+*.npz
+bert_results.csv
+grid_bert_results.csv
+result_*.csv
+results/
+experimentos/jev_cache.csv
+experimentos/jev_fewshot_cache*.csv
+
+# saida do baseline (regerada por baseline.py)
+test1_baseline.xlsx
+
+# python / sistema
+__pycache__/
+*.pyc
+.DS_Store
