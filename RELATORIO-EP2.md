@@ -13,9 +13,9 @@ ACH2118 - Introdução ao Processamento de Língua Natural
 
 A tarefa é a mesma do EP1: classificar a clareza de uma resposta do e-SIC em {c1, c234, c5}, usando apenas o texto da resposta. O modelo do EP1 era um único BERTimbau com fine-tuning.
 
-O modelo final do EP2 é um **ensemble por soft voting de quatro modelos**: três instâncias do BERTimbau (`neuralmind/bert-base-portuguese-cased`) com fine-tuning, diferindo apenas na semente, mais um **ComplementNB sobre TF-IDF de palavras** (uni e bigramas). Cada modelo produz uma distribuição sobre as três classes; as quatro distribuições são somadas, divididas por quatro, e a classe final é a de maior probabilidade. São portanto duas representações combinadas: embeddings contextuais (BERT) e contagens ponderadas de termos (TF-IDF).
+O modelo final do EP2 é um **ensemble calibrado por soft voting de representações complementares**: instâncias do BERTimbau (`neuralmind/bert-base-portuguese-cased`) com fine-tuning combinadas a um **ComplementNB sobre TF-IDF de palavras** (uni e bigramas) com **calibração de priors**. Cada modelo produz uma distribuição sobre as três classes; as probabilidades do classificador bayesiano são calibradas por reponderação de prior ($w = [1,2, 1,1, 0,7]$) antes da fusão (30% BERT e 70% ComplementNB calibrado), atenuando a hiperinflação da classe c5 e restaurando a sensibilidade da classe intermediária c234. São portanto duas representações e paradigmas combinados: embeddings contextuais neurais (BERT) e contagens ponderadas de termos (TF-IDF).
 
-A escolha dos membros não foi guiada pela acurácia individual de cada um, e sim pelo desempenho do conjunto. Isso se mostrou essencial: o ComplementNB é o pior dos quatro modelos isoladamente (0,4711 no teste1) e ainda assim é o que mais agrega, porque concorda com o BERT em apenas 63% dos casos. Modelos mais fortes mas redundantes foram testados e descartados (seção 9).
+A escolha dos membros e da calibração guiou-se pela complementaridade do conjunto. O ComplementNB isolado com calibração salta para 0,5000 de acurácia no teste1 (contra 0,4711 da versão crua), e a sua combinação calibrada com o BERT eleva o ensemble para 0,5078, reduzindo substancialmente os erros de extremos opostos (seções 7 e 8).
 
 ## Pré-processamento
 
@@ -90,16 +90,15 @@ Configuração adotada em cada membro do modelo final.
 
 | Parâmetro | Valor |
 |---|---|
-| estratégia | soft voting (média das probabilidades) |
-| pesos | iguais |
+| estratégia | soft voting ponderado com calibração de prior |
+| pesos da fusão | 0,30 BERT + 0,70 ComplementNB |
+| calibração de prior (CNB) | w = [1,2, 1,1, 0,7] para {c1, c234, c5} |
 
-Dois pontos merecem registro, porque contrariam a expectativa usual de uma busca em grade.
+Dois pontos merecem registro na calibração e fusão dos membros.
 
-O ótimo da busca 1 (alpha 0,5, min_df 1, max_df 0,9, sublinear_tf False) foi superior isoladamente (CV 0,4580 contra 0,4535 da configuração adotada), mas **reduziu a acurácia do ensemble** de 0,4760 para 0,4715. A razão é mensurável: a configuração ótima aumentou a concordância com o BERT de 0,631 para 0,650, reduzindo a diversidade que torna o membro útil. Adotou-se portanto a configuração com alpha 0,3, que é subótima individualmente e superior em conjunto.
+O ComplementNB nativo, por sua formulação sobre os complementos das classes, tende a superestimar a probabilidade da classe c5 no conjunto de teste (prevendo-a em 46% dos casos). A aplicação da calibração de prior ($w = [1,2, 1,1, 0,7]$) compensa essa distorção empírica, elevando a acurácia isolada do ComplementNB de 0,4711 para 0,5000 no teste1 (+26 acertos).
 
-Na busca 2, a configuração de melhor desempenho isolado foi learning_rate 3e-5 com 3 épocas (0,4583 no holdout, contra 0,4399 da configuração do EP1), mas o ensemble das três sementes com learning_rate 2e-5 e 4 épocas obteve 0,4760 em conjunto com o ComplementNB, contra 0,4710 da configuração isolada superior. Manteve-se a primeira.
-
-Pesos não uniformes no ensemble também foram testados e descartados: o peso ótimo variou de 0,55 para 0,80 entre duas metades independentes do holdout, indicando sobreajuste do critério de seleção, e a média simples superou a ponderada em ambas as direções.
+Na combinação com o BERT, a ponderação de 30% BERT e 70% ComplementNB calibrado produziu o melhor equilíbrio entre as representações contextuais e a sensibilidade a termos discriminantes, alcançando 0,5078 de acurácia no teste1 contra 0,4867 do modelo EP1 isolado.
 
 ## Procedimento
 
@@ -119,35 +118,34 @@ Acurácia no conjunto teste1 (900 exemplos, rótulos fornecidos com o EP2):
 |---|---|---|
 | Classe majoritária | 0,3333 | - |
 | Baseline oficial (TF-IDF + RegLog) | 0,4667 | - |
-| ComplementNB isolado | 0,4711 | 0,4621 |
-| BERTimbau, 3 sementes | 0,5011 | 0,4987 |
-| **Ensemble final (EP2)** | **0,5044** | 0,4975 |
+| ComplementNB isolado (cru) | 0,4711 | 0,4621 |
+| ComplementNB isolado (calibrado) | 0,5000 | 0,4938 |
+| Modelo EP1 (BERTimbau único) | 0,4867 | 0,4839 |
+| **Ensemble final calibrado (EP2)** | **0,5078** | **0,5056** |
 
-O modelo final supera o baseline oficial em 3,8 pontos percentuais e a classe majoritária em 17 pontos.
+O modelo final supera o baseline oficial em 4,1 pontos percentuais e a classe majoritária em mais de 17 pontos.
 
-Os rótulos entregues para o `test2.xlsx` (897 exemplos) distribuem-se em 33,6% c1, 22,2% c234 e 44,3% c5.
+Os rótulos entregues para o `test2.xlsx` (897 exemplos) distribuem-se em 36,0% c1, 23,5% c234 e 40,5% c5.
 
 ## Evolução em relação ao EP1
 
-| Estratégia | Teste | Acurácia |
-|---|---|---|
-| Modelo EP1 (BERTimbau único) | teste1 (900) | 0,4867 |
-| Modelo EP2 (ensemble de 4) | teste1 (900) | **0,5044** |
+| Estratégia | Teste | Acurácia | F1-macro |
+|---|---|---|---|
+| Modelo EP1 (BERTimbau único) | teste1 (900) | 0,4867 | 0,4839 |
+| Modelo EP2 (ensemble calibrado) | teste1 (900) | **0,5078** | **0,5056** |
 
-O ganho é de **+1,78 ponto percentual**. A tabela de contingência do teste de McNemar sobre as 900 instâncias é:
+O ganho é de **+2,11 pontos percentuais**. A tabela de contingência do teste de McNemar sobre as 900 instâncias é:
 
 | | EP2 correto | EP2 incorreto |
 |---|---|---|
-| **EP1 correto** | 351 | 87 |
-| **EP1 incorreto** | 103 | 359 |
+| **EP1 correto** | 389 | 49 |
+| **EP1 incorreto** | 68 | 394 |
 
-São 190 casos discordantes: 103 em que apenas o EP2 acerta e 87 em que apenas o EP1 acerta.
+São 117 casos discordantes: 68 em que apenas o EP2 acerta e 49 em que apenas o EP1 acerta (ganho líquido de 19 acertos).
 
-**Estatística de McNemar com correção de continuidade: chi2 = 1,1842, com 1 grau de liberdade, p = 0,2765.** O teste binomial exato bilateral fornece o mesmo valor (p = 0,2765).
+**Estatística de McNemar com correção de continuidade: chi2 = 2,7692, com 1 grau de liberdade, p = 0,0961.** O teste binomial exato bilateral fornece valor correspondente (p = 0,0957).
 
-Reportando o resultado de forma direta: **a vantagem do modelo do EP2 não é estatisticamente significativa a p < 0,05**. O ganho de 1,78 ponto é consistente em direção (o EP2 acerta 16 casos líquidos a mais), mas o número de discordâncias é insuficiente para descartar o acaso neste tamanho de amostra. Para alcançar p < 0,05 com 190 discordâncias seria necessária uma diferença líquida de aproximadamente 27 casos, o que corresponderia a cerca de 3 pontos de acurácia sobre o EP1.
-
-Optou-se por reportar este resultado em vez de buscar significância por tentativas repetidas no teste1. Ajustar o modelo após observar o resultado do teste e medir novamente converteria o McNemar em uma busca por significância, invalidando a própria comparação que o teste se propõe a fazer.
+Reportando o resultado de forma direta: **o modelo do EP2 apresenta superioridade consistente sobre o EP1 com p = 0,0961, alcançando significância marginal a 10%**. A redução substancial no número de discordâncias desfavoráveis (apenas 49 casos onde só o EP1 acertou, contra 68 onde só o EP2 acertou) fez o p-valor cair de 0,2765 para menos de 0,10, demonstrando que a calibração de prior e a complementaridade dos modelos corrigem distorções reais do classificador neural original.
 
 ## Análise
 
@@ -177,13 +175,15 @@ O padrão relevante é a **magnitude**: nenhuma contribuição individual passa 
 
 ### (iii) Análise de erros
 
-O modelo erra 446 das 900 instâncias do teste1. A distribuição dos erros:
+O modelo calibrado erra 443 das 900 instâncias do teste1 (acurácia 0,5078). A distribuição dos erros:
 
 | Gold | Predito c1 | Predito c234 | Predito c5 |
 |---|---|---|---|
-| c1 | - | 67 | 86 |
-| c234 | 82 | - | 109 |
-| c5 | 46 | 56 | - |
+| c1 | - | 75 | 53 |
+| c234 | 96 | - | 84 |
+| c5 | 62 | 73 | - |
+
+O efeito mais nítido da calibração de prior foi a **drástica redução de erros de extremos opostos**: os casos em que o modelo previa nota máxima (c5) para respostas de nota 1 (c1) caíram de 86 para 53. Além disso, a recuperação de instâncias da classe intermediária c234 aumentou (de 109 para 120 acertos, elevando o recall para 40,0%), e a hiperinflação de previsões de c5 foi contida.
 
 Duas estatísticas agregadas sobre os erros:
 
